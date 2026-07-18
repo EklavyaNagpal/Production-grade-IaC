@@ -1,0 +1,23 @@
+aws_region                = "us-east-1"
+environment               = "staging"
+name_prefix               = "cd-staging"
+deployment_mode           = "containerized"
+vpc_cidr                  = "10.20.0.0/16"
+public_subnet_cidrs       = ["10.20.0.0/24", "10.20.1.0/24"]
+private_app_subnet_cidrs  = ["10.20.10.0/24", "10.20.11.0/24"]
+private_db_subnet_cidrs   = ["10.20.20.0/24", "10.20.21.0/24"]
+frontend_image            = "123456789012.dkr.ecr.us-east-1.amazonaws.com/frontend:latest"
+backend_image             = "123456789012.dkr.ecr.us-east-1.amazonaws.com/backend:latest"
+db_name                   = "appdb"
+db_username               = "appuser"
+db_instance_class         = "db.t4g.medium"
+db_allocated_storage      = 100
+db_max_allocated_storage  = 500
+db_engine_version         = "16.3"
+amplify_repo_url          = "https://github.com/your-org/your-repo"
+amplify_access_token      = "REPLACE_ME"
+
+tags = {
+  Owner   = "platform-team"
+  CostCtr = "engineering"
+}

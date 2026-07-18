@@ -1,0 +1,23 @@
+aws_region                = "us-east-1"
+environment               = "dev"
+name_prefix               = "cd-dev"
+deployment_mode           = "containerized"
+vpc_cidr                  = "10.10.0.0/16"
+public_subnet_cidrs       = ["10.10.0.0/24", "10.10.1.0/24"]
+private_app_subnet_cidrs  = ["10.10.10.0/24", "10.10.11.0/24"]
+private_db_subnet_cidrs   = ["10.10.20.0/24", "10.10.21.0/24"]
+frontend_image            = "123456789012.dkr.ecr.us-east-1.amazonaws.com/frontend:latest"
+backend_image             = "123456789012.dkr.ecr.us-east-1.amazonaws.com/backend:latest"
+db_name                   = "appdb"
+db_username               = "appuser"
+db_instance_class         = "db.t4g.small"
+db_allocated_storage      = 50
+db_max_allocated_storage  = 200
+db_engine_version         = "16.3"
+amplify_repo_url          = "https://github.com/your-org/your-repo"
+amplify_access_token      = "REPLACE_ME"
+
+tags = {
+  Owner   = "platform-team"
+  CostCtr = "engineering"
+}
