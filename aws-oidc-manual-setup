@@ -1,0 +1,38 @@
+name: Verify manually configured AWS OIDC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  verify-aws-identity:
+    name: Assume manually configured IAM role
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate repository variables
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          test -n "$AWS_ACCOUNT_ID" || { echo "Missing repository variable: AWS_ACCOUNT_ID"; exit 1; }
+          test -n "$AWS_REGION" || { echo "Missing repository variable: AWS_REGION"; exit 1; }
+          test -n "$AWS_ROLE_ARN" || { echo "Missing repository variable: AWS_ROLE_ARN"; exit 1; }
+
+      - name: Configure short-lived AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: github-actions-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+          role-duration-seconds: 900
+          mask-aws-account-id: true
+          translate-env-variables: false
+
+      - name: Verify caller identity
+        run: aws sts get-caller-identity
