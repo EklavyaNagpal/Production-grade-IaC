@@ -1,0 +1,344 @@
+name: PROD-Deploy-PW-Invoicing-lambda
+
+on:
+  workflow_dispatch:
+    inputs:
+      ContinueOnError:
+        type: choice
+        description: 'Continue on SonarQube scan failures?'
+        required: true
+        options:
+          - false
+          - true
+      # ContinueOnErrorSnyk:
+      #   type: choice
+      #   description: 'Continue on Snyk scan failures?'
+      #   required: true
+      #   options:
+      #     - false
+      #     - true
+
+permissions:
+  id-token: write
+  contents: write
+
+env:
+  SERVICE: pw-invoicing
+  RC: RC1
+  V: V1
+  CFN_STACK: ./pw_invoicing/templates/cfn-lambda.yaml
+  LAMBDA_FUNCTION_NAME: completed-submission-lambda
+
+jobs:
+  sonarqube:
+    name: sonarqube code check
+    runs-on: [self-hosted, bolt-ubuntu]
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - uses: pfizer-github-automation/sonar-scan-action@main
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_ROOT_CERT: ${{ secrets.SONAR_ROOT_CERT }}
+
+      - name: Set ContinueOnError
+        run: |
+          if [ "x${{ github.event.inputs.ContinueOnError }}x" == "xx" ]; then
+            CONTINUE_ON_ERROR=false
+          else
+            CONTINUE_ON_ERROR=${{ github.event.inputs.ContinueOnError }}
+          fi
+          echo "CONTINUE_ON_ERROR=$CONTINUE_ON_ERROR" >> $GITHUB_ENV
+
+      # - name: Set ContinueOnError for snyk
+      #   run: |
+      #     if [ "x${{ github.event.inputs.ContinueOnErrorSnyk }}x" == "xx" ]; then
+      #       CONTINUE_ON_ERROR_SNYK=false
+      #     else
+      #       CONTINUE_ON_ERROR_SNYK=${{ github.event.inputs.ContinueOnError }}
+      #     fi
+      #     echo "CONTINUE_ON_ERROR_SNYK=$CONTINUE_ON_ERROR_SNYK" >> $GITHUB_ENV
+
+      # If you wish to fail your job when the Quality Gate is red, uncomment the
+      # following lines. This would typically be used to fail a deployment.
+      # We do not recommend to use this in a pull request. Prefer using pull request
+      # decoration instead.
+      - uses: sonarsource/sonarqube-quality-gate-action@master
+        if: ${{ env.CONTINUE_ON_ERROR == 'false' }}
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # call-cfn-lint-shared-workflow-in-vessel-platform:
+  #   name: Caller-CFN Lint
+  #   #uses: ./.github/workflows/SonarqubeCode.yaml
+  #   uses: pfizer/vessel-platform/.github/workflows/cfn-lint.yaml@fix-vessel-guardrails
+  #   with:
+  #     Service: ${{ inputs.Service }}
+
+  deploy:
+    name: Deploy
+    environment: prod
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.IAS_GENAI_APP_ID }}
+          private-key: ${{ secrets.IAS_GENAI_APP_SECRET }}
+          owner: pfizer-analytics
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Environment Variables
+        id: envVariables
+        run: |
+
+          # set the application name
+          APP_NAME=vsl-${{ env.SERVICE }}
+          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+
+          # LAMBDA_NAME=${{ env.LAMBDA_FUNCTION_NAME }}
+          # echo "LAMBDA_NAME=$LAMBDA_NAME" >>$GITHUB_ENV
+          # echo "$LAMBDA_NAME"
+          # echo "$APP_NAME"
+          # echo "$V"
+
+          # TAG=${{ github.ref_name }}
+          # echo "TAG=$TAG" >> $GITHUB_ENV
+          # if [[ $TAG != "*${{ env.LAMBDA_NAME }}*" ]]; then
+          #       echo "The service for the selected github tag and workflow does not match"
+          #       exit 1
+          # fi
+
+          # latestTag=`git tag -l | sort -V | grep "${{ env.LAMBDA_NAME }}-${{ env.V }}" | tail -n 1 || true`
+          # echo "Latest git tag"
+          # echo $latestTag
+
+          # # increate the RC tag by one
+          # if [ x"$latestTag" == x ]; then
+          #   NEW_TAG=${{ env.LAMBDA_NAME }}-${{ env.V }}.0
+          # else
+          #   # get the version, increase the number that is after dot by 1
+          #   version=${latestTag#${{ env.LAMBDA_NAME }}-${{ env.V }}.}
+          #   NEW_TAG=${{ env.LAMBDA_NAME }}-${{ env.V }}.$((version+1))
+          # fi
+          # echo "New GitHub tag:$NEW_TAG"
+          # echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
+          # echo "$NEW_TAG"
+
+          LAMBDA_NAME=${{ env.LAMBDA_FUNCTION_NAME }}
+          echo "LAMBDA_NAME=$LAMBDA_NAME" >>$GITHUB_ENV
+          echo "$LAMBDA_NAME"
+          echo "$APP_NAME"
+          echo "$V"
+
+          TAG=${{ github.ref_name }}
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          if [[ $TAG != *"$LAMBDA_NAME"* ]]; then
+            echo "The service for the selected github tag and workflow does not match"
+            exit 1
+          fi
+
+          latestTag=$(git tag -l | sort -V | grep -F "$LAMBDA_NAME-${{ env.V }}" | tail -n 1 || true)
+          echo "Latest git tag"
+          echo $latestTag
+
+          # Increment the RC tag by one
+          if [ -z "$latestTag" ]; then
+            NEW_TAG="$LAMBDA_NAME-${{ env.V }}.0"
+          else
+            version=${latestTag#$LAMBDA_NAME-${{ env.V }}.}
+            NEW_TAG="$LAMBDA_NAME-${{ env.V }}.$((version+1))"
+          fi
+          echo "New GitHub tag:$NEW_TAG"
+          echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
+          echo "$NEW_TAG"
+
+          # Store the original directory
+          ORIGINAL_DIR=$(pwd)
+
+          # Navigate to the pw-integration-bridge directory containing the file
+          cd pw-integration-bridge
+
+          # define default tags from defaultTags.json
+          DEFAULT_TAGS=`envsubst < defaultTags.json`
+          DEFAULT_TAGS=`echo $DEFAULT_TAGS | tr -d '\n[]' | tr -s " "`
+          echo "Default tags $DEFAULT_TAGS"
+          echo "DEFAULT_TAGS=$DEFAULT_TAGS" >> $GITHUB_ENV
+
+          # Return to the original directory
+          cd $ORIGINAL_DIR
+
+          # set environment to prod
+          ENVIRONMENT=prod
+          echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+          echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_OUTPUT
+
+          # # set cfn stack
+          # if [ -f pw-integration-bridge/${{ env.SERVICE }}/cfn-fargate.yaml ]; then
+          #   echo "CFN stack exists in service directory"
+          #   echo "CFN_STACK=${{ env.SERVICE }}/cfn-fargate.yaml" >> $GITHUB_ENV
+          # else
+          #   echo "CFN_STACK=template/cfn-fargate.yaml" >> $GITHUB_ENV
+          # fi
+
+          # # set cfn stackset
+          # if [ -f ${{ env.SERVICE }}/cfn-stackset.yaml ]; then
+          #   echo "CFN stackset exists in service directory"
+          #   echo "CFN_STACKSET=${{ env.SERVICE }}/cfn-stackset.yaml" >> $GITHUB_ENV
+          # else
+          #   echo "CFN_STACKSET=template/cfn-stackset.yaml" >> $GITHUB_ENV
+          # fi
+
+          # # set stack config file
+          # if [ -f ${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME-stack.params ]; then
+          #   STACK_CONFIG=`cat ${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME-stack.params | tr '\n' ','`
+          #   echo "STACK_CONFIG=$STACK_CONFIG" >> $GITHUB_ENV
+          # else
+          #   echo "STACK_CONFIG=\"Env=${{ env.ENVIRONMENT }}\"" >> $GITHUB_ENV
+          # fi
+
+          # set environment variables file
+          if [ -f ${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME.env ]; then
+            # ENV_FILE="${{ env.SERVICE }}/$ENVIRONMENT-$APP_NAME.env"
+            ENV_FILE="${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME.env"
+            echo "ENV_FILE=$ENV_FILE" >> $GITHUB_ENV
+          fi
+
+          # set secrets file
+          if [ -f ${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME-secrets.yaml ]; then
+            SECRETS_FILE="${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME-secrets.yaml"
+            echo "SECRETS_FILE=$SECRETS_FILE" >> $GITHUB_ENV
+          fi
+
+      # # Check if CFN is Compliant
+      # - name: Snyk CFN Validation
+      #   id: snyk-cfn-validation
+      #   continue-on-error: ${{ fromJSON(env.CONTINUE_ON_ERROR_SNYK) }}
+      #   uses: snyk/actions/iac@master
+      #   env:
+      #     SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      #   with:
+      #     file: "${{ env.CFN_STACK }}"
+      #     args: --severity-threshold=high
+
+      # # Scan requirements.txt
+      # - name: Scan requirements.txt
+      #   id: scanRequirements
+      #   continue-on-error: ${{ fromJSON(env.CONTINUE_ON_ERROR_SNYK) }}
+      #   uses: snyk/actions/python@master
+      #   env:
+      #     SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      #   with:
+      #     args: --file=./pw-integration-bridge/cq-tp-common-resources/lambda/${{ env.LAMBDA_NAME }}/requirements.txt --severity-threshold=high --skip-unresolved=true
+
+      # configure credentials with OIDC in Test
+      - name: Configure AWS Credentials for TEST
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT }}:role/${{ secrets.OIDC_ROLE_FARGATE }}
+          role-session-name: test-${{env.APP_NAME}}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Pull Docker Image from test env
+      - name: Login to Amazon ECR
+        id: login-test-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Pull images from Test ECR
+        id: pull-test-images
+        env:
+          ECR_REGISTRY: ${{ steps.login-test-ecr.outputs.registry }}
+          ECR_REPOSITORY: test-${{ env.APP_NAME }}-${{ env.LAMBDA_NAME }}
+          IMAGE_TAG: ${{ env.TAG }}
+        run: |
+          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+
+      # # scan image with snyk
+      # - name: Snyk Scan Image
+      #   id: container-scan
+      #   continue-on-error: ${{ fromJSON(env.CONTINUE_ON_ERROR_SNYK) }}
+      #   uses: snyk/actions/docker@master
+      #   env:
+      #     SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      #   with:
+      #     image: ${{ env.IMAGE_URI }}
+      #     args: --file=./pw-integration-bridge/cq-tp-common-resources/lambda/${{ env.LAMBDA_NAME }}/Dockerfile --severity-threshold=high
+
+      # configure credentials with OIDC in PROD
+      - name: configure aws credentials for Prod environment
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.PROD_AWS_ACCOUNT }}:role/${{ secrets.PROD_OIDC_ROLE_FARGATE }}
+          role-session-name: ${{ env.ENVIRONMENT }}-${{ env.APP_NAME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # create ECR repo if not exists in PROD
+      - name: Login to Prod ECR
+        id: login-prod-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: "Create ECR repo"
+        uses: byu-oit/github-action-create-ecr-repo-if-missing@v1
+        with:
+          DOCKER_REPO_NAME: "${{ env.ENVIRONMENT }}-${{ env.APP_NAME }}-${{ env.LAMBDA_NAME }}"
+
+      - name: Tag and Push to Prod ECR
+        id: pushImage
+        env:
+          ECR_REGISTRY: ${{ steps.login-prod-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ENVIRONMENT }}-${{ env.APP_NAME }}-${{ env.LAMBDA_NAME }}
+          IMAGE_TAG: ${{ env.NEW_TAG }}
+        run: |
+          docker tag ${{ env.IMAGE_URI }} $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker tag ${{ env.IMAGE_URI }} $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          PROD_IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "PROD_IMAGE_URI=$PROD_IMAGE_URI" >> $GITHUB_ENV
+
+      - name: Deploy to AWS with CloudFormation
+        id: deployStack
+        uses: aws-actions/aws-cloudformation-github-deploy@v1.1.0
+        with:
+          name: ${{ env.ENVIRONMENT }}-${{ env.APP_NAME }}-${{ env.LAMBDA_NAME }}
+          template: "${{ env.CFN_STACK }}"
+          no-fail-on-empty-changeset: "1"
+          capabilities: CAPABILITY_NAMED_IAM, CAPABILITY_AUTO_EXPAND
+          tags: '[
+            ${{ env.DEFAULT_TAGS }},
+            {Key: "Usecase",Value: "${{ env.SERVICE }}"}
+            ]'
+          parameter-overrides: >-
+            LambdaName=        ${{ env.LAMBDA_NAME }},
+            Env=               ${{ env.ENVIRONMENT }},
+            ImageUri=          ${{ env.PROD_IMAGE_URI }},
+            Name=              ${{ env.SERVICE }},
+            IngressStackName=  ${{ env.ENVIRONMENT }}-vsl-ingress,
+            DeveloperEmail2=   VTP_Error_Notifications@transperfect.com,
+            DeveloperEmail3=   DL-VOX-TRANSLATE-TEAM@pfizer.com
+
+      - name: Create Tag and Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }} # This token is provided by Actions, you do not need to create your own token
+        with:
+          tag_name: ${{ env.NEW_TAG }}
+          release_name: Release ${{ env.NEW_TAG }}
+          body: |
+            Release ${{ env.NEW_TAG }} created from Tag ${{ env.TAG }}
+          draft: false
+          prerelease: false

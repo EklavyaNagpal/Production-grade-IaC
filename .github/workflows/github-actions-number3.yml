@@ -1,0 +1,243 @@
+name: Update-PW-Invoicing-Service-Line-LOV-Secret
+
+on:
+  workflow_dispatch:
+    inputs:
+      Environment:
+        type: choice
+        description: 'Target environment'
+        required: true
+        options:
+          - test
+          - prod
+      Operation:
+        type: choice
+        description: 'upsert = add new / update existing project (matched by project_name). remove = delete project(s).'
+        required: true
+        options:
+          - upsert
+          - remove
+      LovEntries:
+        type: string
+        description: 'JSON array, e.g. [{"project_name":"TAG CTSS and TransPerfect","vendor":"TransPerfect","management_fee":"10%","service_lov":"-250666"}] (vendor optional)'
+        required: true
+      DryRun:
+        type: boolean
+        description: 'Dry run (show the change without writing to AWS)'
+        required: true
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: pw-invoicing-lov-secret-${{ inputs.Environment }}
+  cancel-in-progress: false
+
+env:
+  SERVICE: pw-invoicing
+  SECRET_KEY: SERVICE_LINE_LOV_DETAILS
+
+jobs:
+  update-secret:
+    name: Update ${{ inputs.Environment }} SERVICE_LINE_LOV_DETAILS
+    environment: ${{ inputs.Environment }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Environment Variables
+        id: envVariables
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.Environment }}
+        run: |
+          APP_NAME=vsl-${{ env.SERVICE }}
+          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+
+          ENVIRONMENT="$INPUT_ENVIRONMENT"
+          echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+
+          # Secret Manager name convention: <env>-vsl-pw-invoicing-secrets
+          SECRET_ID="$ENVIRONMENT-$APP_NAME-secrets"
+          echo "SECRET_ID=$SECRET_ID" >> $GITHUB_ENV
+          echo "Target secret: $SECRET_ID / key: ${{ env.SECRET_KEY }}"
+
+          WORK_DIR="$RUNNER_TEMP/lov"
+          mkdir -p "$WORK_DIR" && chmod 700 "$WORK_DIR"
+          echo "WORK_DIR=$WORK_DIR" >> $GITHUB_ENV
+
+      # Inputs are passed via env (never inlined into the script) to prevent script injection
+      - name: Validate LOV entries
+        env:
+          LOV_ENTRIES: ${{ inputs.LovEntries }}
+          OPERATION: ${{ inputs.Operation }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          if ! echo "$LOV_ENTRIES" | jq -e 'type == "array" and length > 0' > /dev/null 2>&1; then
+            echo "::error::LovEntries must be a non-empty JSON array"
+            exit 1
+          fi
+
+          # Normalise: accept "project name" or project_name, trim, force strings; vendor is optional
+          echo "$LOV_ENTRIES" | jq -c '
+            def clean: tostring | sub("^\\s+"; "") | sub("\\s+$"; "");
+            def field($k): (.[$k] // .[$k | gsub("_"; " ")] // "" | clean);
+            map(
+              field("vendor") as $vendor
+              | {
+                  project_name:   field("project_name"),
+                  management_fee: field("management_fee"),
+                  service_lov:    field("service_lov")
+                }
+              + (if $vendor != "" then {vendor: $vendor} else {} end)
+            )' > "$WORK_DIR/entries.json"
+
+          ERRORS=$(jq -r --arg op "$OPERATION" '
+            to_entries[] | .key as $i | .value as $e
+            | (if ($e.project_name | length) == 0 then "entry \($i): project_name is required" else empty end),
+              (if $op == "upsert" and ($e.management_fee | test("^[0-9]+(\\.[0-9]+)?%$") | not)
+                 then "entry \($i): management_fee must look like 10% or 5.5% (got \"\($e.management_fee)\")" else empty end),
+              (if $op == "upsert" and ($e.service_lov | test("^-?[0-9]+$") | not)
+                 then "entry \($i): service_lov must be numeric, e.g. -250666 (got \"\($e.service_lov)\")" else empty end)
+          ' "$WORK_DIR/entries.json")
+
+          DUPES=$(jq -r 'group_by(.project_name)[] | select(length > 1) | .[0].project_name' "$WORK_DIR/entries.json")
+          if [ -n "$DUPES" ]; then
+            ERRORS="$ERRORS"$'\n'"duplicate project_name in input: $DUPES"
+          fi
+
+          if [ -n "$(echo "$ERRORS" | tr -d '[:space:]')" ]; then
+            echo "$ERRORS" | sed '/^$/d; s/^/::error::/'
+            exit 1
+          fi
+
+          echo "Validated entries ($OPERATION):"
+          jq . "$WORK_DIR/entries.json"
+
+      # configure credentials with OIDC (same accounts/roles as the deploy pipelines)
+      - name: Configure AWS Credentials for TEST
+        if: ${{ inputs.Environment == 'test' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT }}:role/${{ secrets.OIDC_ROLE_FARGATE }}
+          role-session-name: ${{ env.ENVIRONMENT }}-${{ env.APP_NAME }}-lov
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Configure AWS Credentials for PROD
+        if: ${{ inputs.Environment == 'prod' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.PROD_AWS_ACCOUNT }}:role/${{ secrets.PROD_OIDC_ROLE_FARGATE }}
+          role-session-name: ${{ env.ENVIRONMENT }}-${{ env.APP_NAME }}-lov
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Build updated secret
+        env:
+          OPERATION: ${{ inputs.Operation }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          aws secretsmanager get-secret-value \
+            --secret-id "$SECRET_ID" \
+            --query '{s: SecretString, v: VersionId}' \
+            --output json > "$WORK_DIR/current_raw.json"
+
+          PREVIOUS_VERSION_ID=$(jq -r '.v' "$WORK_DIR/current_raw.json")
+          echo "PREVIOUS_VERSION_ID=$PREVIOUS_VERSION_ID" >> $GITHUB_ENV
+          jq -r '.s' "$WORK_DIR/current_raw.json" > "$WORK_DIR/current.json"
+          rm -f "$WORK_DIR/current_raw.json"
+
+          if ! jq -e 'type == "object"' "$WORK_DIR/current.json" > /dev/null; then
+            echo "::error::Secret $SECRET_ID is not a key/value JSON secret"
+            exit 1
+          fi
+
+          # Current LOV list (stored as a JSON string inside the secret; tolerate a nested array too)
+          jq --arg key "$SECRET_KEY" '
+            (.[$key] // "[]") | if type == "string" then (if . == "" then [] else fromjson end) else . end
+          ' "$WORK_DIR/current.json" > "$WORK_DIR/lov_before.json"
+
+          if [ "$OPERATION" == "remove" ]; then
+            MISSING=$(jq -r --slurpfile cur "$WORK_DIR/lov_before.json" '
+              ($cur[0] | map(.project_name)) as $names
+              | .[] | select(.project_name as $n | $names | index($n) | not) | .project_name
+            ' "$WORK_DIR/entries.json")
+            if [ -n "$MISSING" ]; then
+              echo "$MISSING" | sed 's/^/::warning::Project not found in secret, nothing to remove: /'
+            fi
+
+            jq --slurpfile e "$WORK_DIR/entries.json" '
+              ($e[0] | map(.project_name)) as $rm
+              | map(select(.project_name as $n | $rm | index($n) | not))
+            ' "$WORK_DIR/lov_before.json" > "$WORK_DIR/lov_after.json"
+          else
+            jq --slurpfile e "$WORK_DIR/entries.json" '
+              reduce $e[0][] as $new (.;
+                if any(.[]; .project_name == $new.project_name)
+                then map(if .project_name == $new.project_name then . + $new else . end)
+                else . + [$new]
+                end)
+            ' "$WORK_DIR/lov_before.json" > "$WORK_DIR/lov_after.json"
+          fi
+
+          # Write back in the same shape it was read (string vs array); all other keys untouched
+          jq -c --arg key "$SECRET_KEY" --slurpfile lov "$WORK_DIR/lov_after.json" '
+            .[$key] = (if (.[$key] | type) == "array" then $lov[0] else ($lov[0] | tojson) end)
+          ' "$WORK_DIR/current.json" > "$WORK_DIR/new.json"
+
+          echo "---- $SECRET_KEY diff (other secret keys are not shown and not modified) ----"
+          if diff -u <(jq . "$WORK_DIR/lov_before.json") <(jq . "$WORK_DIR/lov_after.json"); then
+            echo "No changes detected."
+            echo "HAS_CHANGES=false" >> $GITHUB_ENV
+          else
+            echo "HAS_CHANGES=true" >> $GITHUB_ENV
+          fi
+
+          {
+            echo "### $SECRET_ID → \`$SECRET_KEY\` ($OPERATION)"
+            echo ""
+            echo "| Project Name | Vendor | Service LOV | Management Fee |"
+            echo "|---|---|---|---|"
+            jq -r '.[] | "| \(.project_name) | \(.vendor // "") | \(.service_lov) | \(.management_fee) |"' "$WORK_DIR/lov_after.json"
+            echo ""
+            echo "Previous secret version: \`$PREVIOUS_VERSION_ID\`"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Update AWS Secret
+        if: ${{ !inputs.DryRun && env.HAS_CHANGES == 'true' }}
+        run: |
+          set -euo pipefail
+
+          NEW_VERSION_ID=$(aws secretsmanager put-secret-value \
+            --secret-id "$SECRET_ID" \
+            --secret-string "file://$WORK_DIR/new.json" \
+            --query VersionId --output text)
+
+          # Verify what was written matches what we built
+          aws secretsmanager get-secret-value --secret-id "$SECRET_ID" \
+            --query SecretString --output text > "$WORK_DIR/verify.json"
+          if ! jq -e --slurpfile want "$WORK_DIR/new.json" '. == $want[0]' "$WORK_DIR/verify.json" > /dev/null; then
+            echo "::error::Verification failed - secret content does not match expected value"
+            exit 1
+          fi
+
+          echo "Secret $SECRET_ID updated. New version: $NEW_VERSION_ID"
+          {
+            echo ""
+            echo "**Updated.** New version: \`$NEW_VERSION_ID\`"
+            echo ""
+            echo "Rollback: \`aws secretsmanager update-secret-version-stage --secret-id $SECRET_ID --version-stage AWSCURRENT --move-to-version-id $PREVIOUS_VERSION_ID --remove-from-version-id $NEW_VERSION_ID\`"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Dry run notice
+        if: ${{ inputs.DryRun }}
+        run: |
+          echo "Dry run - no changes written to $SECRET_ID"
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Dry run** - no changes written." >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/lov"

@@ -1,0 +1,435 @@
+on:
+    workflow_dispatch:
+        # inputs:
+        #   ContinueOnError:
+        #     type: choice
+        #     description: 'Continue on SonarQube scan failures?'
+        #     required: true
+        #     options:
+        #       - false
+        #       - true
+        #   ContinueOnErrorSnyk:
+        #     type: choice
+        #     description: 'Continue on Snyk scan failures?'
+        #     required: true
+        #     options:
+        #       - false
+        #       - true
+
+env:
+  SERVICE: pw-tp-bridge
+  RC: RC1
+  V: V1
+
+name: PROD Vessel pw-tp-bridge deployment
+
+permissions:
+    id-token: write
+    contents: write   # This is required for actions/checkout@v3
+
+jobs:
+
+    sonarqube:
+      name: sonarqube code check
+      runs-on: [self-hosted, bolt-ubuntu]
+      steps:
+        - uses: actions/checkout@v3
+          with:
+            fetch-depth: 0
+        - uses: pfizer-github-automation/sonar-scan-action@main
+          env:
+            SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+            SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+            SONAR_ROOT_CERT: ${{ secrets.SONAR_ROOT_CERT }}
+
+        - name: Set ContinueOnError
+          run: |
+            if [ "x${{ github.event.inputs.ContinueOnError }}x" == "xx" ]; then
+              CONTINUE_ON_ERROR=false
+            else
+              CONTINUE_ON_ERROR=${{ github.event.inputs.ContinueOnError }}
+            fi
+            echo "CONTINUE_ON_ERROR=$CONTINUE_ON_ERROR" >> $GITHUB_ENV
+
+      # - name: Set ContinueOnError for snyk
+      #   run: |
+      #     if [ "x${{ github.event.inputs.ContinueOnErrorSnyk }}x" == "xx" ]; then
+      #       CONTINUE_ON_ERROR_SNYK=false
+      #     else
+      #       CONTINUE_ON_ERROR_SNYK=${{ github.event.inputs.ContinueOnError }}
+      #     fi
+      #     echo "CONTINUE_ON_ERROR_SNYK=$CONTINUE_ON_ERROR_SNYK" >> $GITHUB_ENV
+
+      # If you wish to fail your job when the Quality Gate is red, uncomment the
+      # following lines. This would typically be used to fail a deployment.
+      # We do not recommend to use this in a pull request. Prefer using pull request
+      # decoration instead.
+        - uses: sonarsource/sonarqube-quality-gate-action@master
+          if: ${{ env.CONTINUE_ON_ERROR == 'false' }}
+          timeout-minutes: 5
+          env:
+            SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    # call-cfn-lint-shared-workflow-in-vessel-platform:
+    #   name: Caller-CFN Lint
+    #   #uses: ./.github/workflows/SonarqubeCode.yaml
+    #   uses: pfizer/vessel-platform/.github/workflows/cfn-lint.yaml@fix-vessel-guardrails
+    #   with:
+    #     Service: ${{ inputs.Service }}
+
+    deploy:
+      name: Deploy
+      environment: prod
+      runs-on: ubuntu-latest
+      steps:
+
+        - name: Generate GitHub App Token
+          id: app-token
+          uses: actions/create-github-app-token@v2
+          with:
+            app-id: ${{ secrets.IAS_GENAI_APP_ID }}
+            private-key: ${{ secrets.IAS_GENAI_APP_SECRET }}
+            owner: pfizer-analytics
+
+        - uses: actions/checkout@v4
+          with:
+            token: ${{ steps.app-token.outputs.token }}
+            fetch-depth: 0
+            persist-credentials: false
+
+        - name: Setup Environment Variables
+          id: envVariables
+          run: |
+            # set the application name
+            APP_NAME=vsl-${{ env.SERVICE }}
+            echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+
+            TAG=${{ github.ref_name }}
+            echo "TAG=$TAG" >> $GITHUB_ENV
+            if [[ $TAG != *"${{ env.SERVICE }}"* ]]; then
+                echo "The service for the selected github tag and workflow does not match"
+                exit 1
+            fi
+            latestTag=`git tag -l | sort -V | grep ${{ env.SERVICE }}-${{ env.V }} | tail -n 1`
+            echo "Latest git tag"
+            echo $latestTag
+
+            # increase the V tag by one
+            if [ x"$latestTag" == x ]; then
+              NEW_TAG=${{ env.SERVICE }}-${{ env.V }}.0
+            else
+              # get the version, increase the number that is after dot by 1
+              version=${latestTag#${{ env.SERVICE }}-${{ env.V }}.}
+              NEW_TAG=${{ env.SERVICE }}-${{ env.V }}.$((version+1))
+            fi
+            echo "New GitHub tag:$NEW_TAG"
+            echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
+
+            # Store the original directory
+            ORIGINAL_DIR=$(pwd)
+
+            # Navigate to the pw-integration-bridge directory containing the file
+            cd pw-integration-bridge
+
+            # define default tags from defaultTags.json
+            DEFAULT_TAGS=`envsubst < defaultTags.json`
+            DEFAULT_TAGS=`echo $DEFAULT_TAGS | tr -d '\n[]' | tr -s " "`
+            echo "Default tags $DEFAULT_TAGS"
+            echo "DEFAULT_TAGS=$DEFAULT_TAGS" >> $GITHUB_ENV
+
+            # Return to the original directory
+            cd $ORIGINAL_DIR
+
+            # set environment to prod
+            ENVIRONMENT=prod
+            echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+            if [ "x${{ github.event.inputs.ContinueOnError }}x" == "xx" ]; then
+              CONTINUE_ON_ERROR=false
+            else
+              CONTINUE_ON_ERROR=${{ github.event.inputs.ContinueOnError }}
+            fi
+            echo "CONTINUE_ON_ERROR=$CONTINUE_ON_ERROR" >> $GITHUB_ENV
+
+            # set cfn stack
+            if [ -f pw-integration-bridge/${{ env.SERVICE }}/cfn-fargate.yaml ]; then
+                echo "CFN stack exists in service directory"
+                echo "CFN_STACK=pw-integration-bridge/${{ env.SERVICE }}/cfn-fargate.yaml" >> $GITHUB_ENV
+            else
+                echo "CFN_STACK=template/cfn-fargate.yaml" >> $GITHUB_ENV
+            fi
+
+            # set cfn stackset
+            # if [ -f pw-integration-bridge/${{ env.SERVICE }}/cfn-stackset.yaml ]; then
+            #     echo "CFN stackset exists in service directory"
+            #     echo "CFN_STACKSET=pw-integration-bridge/${{ env.SERVICE }}/cfn-stackset.yaml" >> $GITHUB_ENV
+            # else
+            #     echo "CFN_STACKSET=template/cfn-stackset.yaml" >> $GITHUB_ENV
+            # fi
+
+            # set stack config file
+            if [ -f pw-integration-bridge/${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME-stack.params ]; then
+              STACK_CONFIG=`cat pw-integration-bridge/${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME-stack.params`
+              echo "STACK_CONFIG=$STACK_CONFIG" >> $GITHUB_ENV
+            else
+              echo "STACK_CONFIG=Env=${{ env.ENVIRONMENT }}" >> $GITHUB_ENV
+            fi
+
+            # # set environment variables file
+            # if [ -f pw-integration-bridge/${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME.env ]; then
+            #   # ENV_FILE="pw-integration-bridge/${{ env.SERVICE }}/$ENVIRONMENT-$APP_NAME.env"
+            #   ENV_FILE="pw-integration-bridge/${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME.env"
+            #   echo "ENV_FILE=$ENV_FILE" >> $GITHUB_ENV
+            # fi
+
+            # set secrets file for 1st region
+            if [ -f pw-integration-bridge/${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME-secrets-${{ secrets.AWS_REGION }}.yaml ]; then
+              SECRETS_FILE_1="pw-integration-bridge/${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME-secrets-${{ secrets.AWS_REGION }}.yaml"
+              echo "SECRETS_FILE_1=$SECRETS_FILE_1" >> $GITHUB_ENV
+            fi
+
+            # # set secrets file for 2nd region
+            # if [ -f pw-integration-bridge/${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME-secrets-eu-central-1.yaml ]; then
+            #   SECRETS_FILE_2="pw-integration-bridge/${{ env.SERVICE }}/config/$ENVIRONMENT-$APP_NAME-secrets-eu-central-1.yaml"
+            #   echo "SECRETS_FILE_2=$SECRETS_FILE_2" >> $GITHUB_ENV
+            # fi
+          #Check if CFN is Compliant
+          # - name: Snyk CFN Validation
+          #   id: snyk-cfn-validation
+          #   continue-on-error: ${{ fromJSON(env.CONTINUE_ON_ERROR_SNYK) }}
+          #   uses: snyk/actions/iac@master
+          #   env:
+          #     SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          #   with:
+          #     file: "${{ env.CFN_STACK }}"
+          #     args: --severity-threshold=high
+
+
+        - name: Configure AWS Credentials
+          uses: aws-actions/configure-aws-credentials@v4
+          with:
+            role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT }}:role/${{ secrets.OIDC_ROLE_FARGATE }}
+            role-session-name: ${{env.ENVIRONMENT}}-${{env.APP_NAME}}
+            aws-region: ${{ secrets.AWS_REGION }}
+
+        - name: Login to Amazon ECR
+          id: login-test-ecr
+          uses: aws-actions/amazon-ecr-login@v1
+
+
+        - name: Pull images from Test ECR
+          id: pull-test-images
+          env:
+            ECR_REGISTRY: ${{ steps.login-test-ecr.outputs.registry }}
+            ECR_REPOSITORY: test-${{ env.APP_NAME }}
+            IMAGE_TAG: ${{ env.TAG }}
+          run: |
+            docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+            echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+
+        # scan image with snyk
+        # - name: Snyk Scan Image
+        #   id: container-scan
+        #   continue-on-error: ${{ fromJSON(env.CONTINUE_ON_ERROR_SNYK) }}
+        #   uses: snyk/actions/docker@master
+        #   env:
+        #     SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        #   with:
+        #     image: ${{ env.IMAGE_URI }}
+        #     args: --file=pw-integration-bridge/${{ env.SERVICE }}/Dockerfile --severity-threshold=high
+
+
+        # configure credentials with OIDC
+        - name: configure aws credentials for Prod environment
+          uses: aws-actions/configure-aws-credentials@v4
+          with:
+            role-to-assume: arn:aws:iam::${{ secrets.PROD_AWS_ACCOUNT }}:role/${{ secrets.PROD_OIDC_ROLE_FARGATE }}
+            role-session-name: ${{ env.ENVIRONMENT }}-${{ env.APP_NAME }}
+            aws-region: ${{ secrets.AWS_REGION }} #Kept AWS_REGION same in Prod
+
+
+        - name: Login to Prod ECR
+          id: login-prod-ecr
+          uses: aws-actions/amazon-ecr-login@v1
+
+
+        # create ECR repo if not exists
+        - name: "Create ECR repo"
+          uses: byu-oit/github-action-create-ecr-repo-if-missing@v1
+          with:
+            DOCKER_REPO_NAME: "${{ env.ENVIRONMENT }}-${{ env.APP_NAME }}"
+
+        - name: Tag and Push to Prod ECR
+          env:
+            ECR_REGISTRY: ${{ steps.login-prod-ecr.outputs.registry }}
+            ECR_REPOSITORY: prod-${{ env.APP_NAME }}
+            IMAGE_TAG: ${{ env.NEW_TAG }}
+          run: |
+            docker tag ${{ env.IMAGE_URI }} $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+            docker tag ${{ env.IMAGE_URI }} $ECR_REGISTRY/$ECR_REPOSITORY:latest
+            docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+            docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+            PROD_IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+            echo "PROD_IMAGE_URI=$PROD_IMAGE_URI" >> $GITHUB_ENV
+
+        # - name: "push csv file to s3"
+        #   run: |
+        #       aws s3 sync ./pw-integration-bridge/cq-tp-common-resources/require_docs s3://${{ env.ENVIRONMENT }}-vsl-require-docs
+        #       pwd
+        #       ls -l
+
+        - name: Setup Environment Variables File
+          id: envFile
+          if: ${{ env.ENV_FILE != '' }}
+          run: |
+            # set bucket name
+            BUCKET_NAME="${{env.ENVIRONMENT}}-vsl-env-files"
+            echo "Bucket name is $BUCKET_NAME"
+            # create s3 bucket if not exists
+            aws s3 mb s3://$BUCKET_NAME --region ${{ secrets.AWS_REGION }}
+            # add tags to s3 bucket
+            aws s3api put-bucket-tagging \
+            --bucket $BUCKET_NAME \
+            --tagging 'TagSet=[
+            {Key=CostCenterID,Value="2320611"},
+            {Key=PrimaryOwner,Value="Evdoxia.Papadopoulou@pfizer.com"},
+            {Key=SecondaryOwner,Value="dl-ias-platform-operations@pfizer.com"},
+            {Key=Platform,Value="VOX-Translate-PRO"},
+            {Key=Usecase,Value="env-files"},
+            {Key=ProjectCode,Value="IT-TRANSLT-01"},
+            {Key=ProjectName,Value="PfizerWorks-Integration"},
+            {Key=EnvType,Value=${{ env.ENVIRONMENT }}},
+            {Key=Implementor,Value="dl-ias-platform-operations@pfizer.com"},
+            {Key=DataClass,Value="Orange"},
+            {Key=WBS,Value="IT-TRANSLT-01"},
+            {Key=GitRepo,Value=${{ github.repository }}},
+            {Key=GitCommit,Value=${{ github.sha }}}'
+
+            # copy env file into s3
+            aws s3 cp ${{ env.ENV_FILE }} s3://$BUCKET_NAME/
+
+        - name: Setup Secrets File
+          id: secretsFile
+          if: ${{ env.SECRETS_FILE_1 != '' }}
+          run: |
+
+            # set bucket name
+            BUCKET_NAME="${{env.ENVIRONMENT}}-vsl-${{ env.SERVICE }}-secrets-files"
+            echo "Bucket name is $BUCKET_NAME"
+
+            # create S3 bucket if not exists
+            aws s3 mb s3://$BUCKET_NAME --region ${{ secrets.AWS_REGION }}
+
+            #add tags to S3 bucket
+            aws s3api put-bucket-tagging \
+            --bucket $BUCKET_NAME \
+            --tagging 'TagSet=[
+            {Key=CostCenterID,Value="2320611"},
+            {Key=PrimaryOwner,Value="Evdoxia.Papadopoulou@pfizer.com"},
+            {Key=SecondaryOwner,Value="dl-ias-platform-operations@pfizer.com"},
+            {Key=Platform,Value="VOX-Translate-PRO"},
+            {Key=Usecase,Value="secrets-files"},
+            {Key=ProjectCode,Value="IT-TRANSLT-01"},
+            {Key=ProjectName,Value="PfizerWorks-Integration"},
+            {Key=EnvType,Value=${{ env.ENVIRONMENT }}},
+            {Key=Implementor,Value="dl-ias-platform-operations@pfizer.com"},
+            {Key=DataClass,Value="Orange"},
+            {Key=WBS,Value="IT-TRANSLT-01"},
+            {Key=GitRepo,Value=${{ github.repository }}},
+            {Key=GitCommit,Value=${{ github.sha }}}'
+
+            # copy secrets file into s3 for 1st region
+            aws s3 cp ${{ env.SECRETS_FILE_1 }} s3://$BUCKET_NAME/
+
+            # # copy secrets file into s3 for 2nd region
+            # aws s3 cp ${{ env.SECRETS_FILE_2 }} s3://$BUCKET_NAME/
+
+        - name: Setup Cloudformation Template File
+          id: cfnTemplateFile
+          if: ${{ env.CFN_STACK != '' }}
+          run: |
+
+            # set bucket name
+            BUCKET_NAME="${{env.ENVIRONMENT}}-${{env.APP_NAME}}"
+            echo "Bucket name is $BUCKET_NAME"
+
+            # create S3 bucket if not exists
+            aws s3 mb s3://$BUCKET_NAME --region ${{ secrets.AWS_REGION }}
+
+            # add tags to S3 bucket
+            aws s3api put-bucket-tagging \
+            --bucket $BUCKET_NAME \
+            --tagging 'TagSet=[
+            {Key=CostCenterID,Value="2320611"},
+            {Key=PrimaryOwner,Value="Evdoxia.Papadopoulou@pfizer.com"},
+            {Key=SecondaryOwner,Value="dl-ias-platform-operations@pfizer.com"},
+            {Key=Platform,Value="VOX-Translate-PRO"},
+            {Key=Usecase,Value="secrets-files"},
+            {Key=ProjectCode,Value="IT-TRANSLT-01"},
+            {Key=ProjectName,Value="PfizerWorks-Integration"},
+            {Key=EnvType,Value=${{ env.ENVIRONMENT }}},
+            {Key=Implementor,Value="dl-ias-platform-operations@pfizer.com"},
+            {Key=DataClass,Value="Orange"},
+            {Key=WBS,Value="IT-TRANSLT-01"},
+            {Key=GitRepo,Value=${{ github.repository }}},
+            {Key=GitCommit,Value=${{ github.sha }}}'
+
+            # copy cfn template file into s3
+            aws s3 cp ${{ env.CFN_STACK }} s3://$BUCKET_NAME/cfn/
+
+          # Run CFN Deploy On Our Stack
+          # Run CFN Deploy On Our Stack
+        - name: Deploy to AWS with CloudFormation
+          id: deployStack
+          uses: aws-actions/aws-cloudformation-github-deploy@v1.1.0
+          with:
+            name: ${{ env.ENVIRONMENT }}-${{ env.APP_NAME }}
+            template: "${{ env.CFN_STACK }}"
+            no-fail-on-empty-changeset: "1"
+            capabilities: CAPABILITY_NAMED_IAM, CAPABILITY_AUTO_EXPAND
+            tags: '[
+              ${{ env.DEFAULT_TAGS }},
+              {Key: "Usecase",Value: "${{ env.SERVICE }}"}
+            ]'
+            parameter-overrides: >-
+              ${{env.STACK_CONFIG}},
+              IngressStackName= ${{ env.ENVIRONMENT }}-vsl-ingress,
+              EcsStackName=     ${{ env.ENVIRONMENT }}-vsl-ecs-cluster,
+              Env=              ${{ env.ENVIRONMENT }},
+              ImageUri=         ${{ env.PROD_IMAGE_URI }},
+              PermissionsBoundary=arn:aws:iam::${{ secrets.PROD_AWS_ACCOUNT }}:policy/PFE-BASELINE-DelegatedUserPermissionsBoundary,
+              Name=             ${{ env.SERVICE }},
+              Branch=           ${{ github.ref_name }},
+              EnvType=          ${{ env.ENVIRONMENT }}
+
+          # Create cloudwatch alarms
+        - name: Create Cloudwatch Alarms via CloudFormation
+          id: deployAlarmsStack
+          uses: aws-actions/aws-cloudformation-github-deploy@v1.1.0
+          with:
+            name: ${{ env.ENVIRONMENT }}-${{ env.APP_NAME }}-monitoring
+            template: "pw-integration-bridge/${{ env.SERVICE }}/cfn-ecs-services-monitoring.yaml"
+            no-fail-on-empty-changeset: "1"
+            capabilities: CAPABILITY_NAMED_IAM, CAPABILITY_AUTO_EXPAND
+            tags: '[
+              ${{ env.DEFAULT_TAGS }},
+              {Key: "Usecase",Value: "${{ env.SERVICE }}"}
+            ]'
+            parameter-overrides: >-
+              Usecase=${{ env.SERVICE }},
+              MemoryThreshold=75,
+              CPUThreshold=75,
+              Env=${{ env.ENVIRONMENT }} ,
+              NotificationsStack=${{ env.ENVIRONMENT }}-vsl-notifications
+
+        - name: Create Tag and Release
+          id: create_release
+          uses: actions/create-release@v1
+          env:
+            GITHUB_TOKEN: ${{ steps.app-token.outputs.token }} # This token is provided by Actions, you do not need to create your own token
+          with:
+            tag_name: ${{ env.NEW_TAG }}
+            release_name: Release ${{ env.NEW_TAG }}
+            body: |
+              Release ${{ env.NEW_TAG }} created from Tag ${{ env.TAG }}
+            draft: false
+            prerelease: false
+
